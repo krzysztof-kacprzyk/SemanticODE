@@ -1,0 +1,14 @@
+# pyproject.toml
+
+[build-system]
+requires      = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["semantic_odes"]
+
+[project]
+name = "semantic_odes"
+version = "1.0.0"
+readme = "README.md"
+dependencies = []
