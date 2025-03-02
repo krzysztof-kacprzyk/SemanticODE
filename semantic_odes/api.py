@@ -14,12 +14,17 @@ from lightning.pytorch.tuner import Tuner
 from semantic_odes.lit_module import LitSketchODE
 import pandas as pd
 import logging
-from semantic_odes.reconstruct_cubic import PredictiveModel, ApproximatePredictiveModel
-from semantic_odes.model_numpy import calculate_loss, calculate_loss_3_samples
+from semantic_odes.trajectory_predictors import PredictiveModel, ApproximatePredictiveModel
+from semantic_odes.model_numpy import calculate_loss
 from semantic_odes.infinite_motifs import get_default_motif_class
+from semantic_odes.property_map import SinglePropertyMap
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import seaborn as sns
+from semantic_odes import utils
+from semantic_odes.composition_map import CompositionMap, solve_branching_problem
+
+INF = 1e9
 
 def process_sample(info):
         sample, compositions, t_range, seed = info
@@ -27,27 +32,12 @@ def process_sample(info):
         sample_scores = {'x0':x0}
         for composition in compositions:
             loss, model = calculate_loss(composition, t_range, x0, t, y, seed=seed, evaluate_on_all_data=True)
+            if np.isnan(loss):
+                loss = INF
             sample_scores[tuple(composition)] = loss
         return sample_scores
 
-def _assign_to_mask(mask,target,input):
-    if np.any(mask):
-        if np.ndim(input) == 0 or type(input) == tuple or type(input) == str:
-            input = [input]*mask.sum()
-        ids = np.arange(len(target))[mask]
-        counter = 0
-        for i in ids:
-            target[i] = input[counter]
-            counter += 1
 
-def format_composition(composition):
-    formatted_motifs = []
-    for motif in composition:
-        # Replace 'c' with 'b' and 'f', 'p' with 'u'
-        motif_string = str(motif).replace('c','b').replace('f','u').replace('p','u')
-        motif_string = "s_{"+str(motif_string)+"}"
-        formatted_motifs.append(motif_string)
-    return fr"$({', '.join(formatted_motifs)})$"
 class BasisFunctions(ABC):
 
     def __init__(self, n_basis):
@@ -212,339 +202,9 @@ def create_full_composition_library(max_length,is_infinite):
     return all_compositions
 
 
-class Cell:
-
-    def __init__(self):
-        self.next_composition = {}
-        self.total_loss = {}
-        self.samples_without_change = {}
-        self.x0_without_change = {}
 
 
-class CompositionMap:
 
-    def __init__(self,composition_map_list):
-        """
-        Args:
-        composition_map_list: list of tuples (x0_range, composition) where x0_range is a tuple (previous_x0, next_x0) and composition is a tuple of motifs
-        """
-        self.composition_map_list = composition_map_list
-
-        self._validate()
-
-    
-    def _validate(self):
-        """
-        Checks if the ranges are valid
-        """
-        if self.composition_map_list[0][0][0] != -np.inf:
-            raise ValueError(f'First range is not valid: {self.composition_map_list[0][0][0]} should be -np.inf')
-        if self.composition_map_list[-1][0][1] != np.inf:
-            raise ValueError(f'Last range is not valid: {self.composition_map_list[-1][0][1]} should be np.inf')
-
-        for i in range(len(self.composition_map_list)-1):
-            (_, next_x0), _ = self.composition_map_list[i]
-            (next_previous_x0, _), _ = self.composition_map_list[i+1]
-            if next_x0 != next_previous_x0:
-                raise ValueError(f'Ranges are not continuous: {next_x0} != {next_previous_x0}')
-
-    def predict(self, X0, with_composition_index=False, reduce=True):
-        """
-        Predict the composition for a given initial conditions
-        
-        Args:
-        X0: numpy array of shape (batch_size, 1) or (batch_size,) or a scalar value with the initial conditions
-
-        Returns:
-        1D np.array (or a single object) with the compositions
-        """
-
-        self._validate()
-
-        is_scalar = np.isscalar(X0)
-
-        # Treat X0 as a 2D array
-        X0 = np.atleast_1d(X0)
-        if len(X0.shape) == 1:
-            X0 = X0.reshape(-1,1)
-        
-        compositions = np.empty(X0.shape[0],dtype=object)
-        composition_indices = np.empty(X0.shape[0],dtype=int)
-
-        for index, (x0_range, composition) in enumerate(self.composition_map_list):
-            mask = (X0 > x0_range[0]) & (X0 <= x0_range[1])
-            _assign_to_mask(mask.flatten(),compositions,composition)
-            composition_indices[mask.flatten()] = index
-        
-        if with_composition_index:
-            if is_scalar and reduce:
-                return compositions[0], composition_indices[0]
-            else:
-                return compositions, composition_indices
-        else:
-            if is_scalar and reduce:
-                return compositions[0]
-            else:
-                return compositions
-        
-
-    def __repr__(self):
-        result = ''
-        for (previous_x0, next_x0), composition in self.composition_map_list:
-            if next_x0 == np.inf:
-                result += f'({previous_x0},+inf):{composition}\n'
-            else:
-                result += f'({previous_x0},{next_x0}]:{composition}\n'
-            
-        return result
-
-    def __len__(self):
-        return len(self.composition_map_list)
-
-
-class SinglePropertyMap:
-
-    def __init__(self,x0_range,x0_finite_range,composition,transition_point_predictor,derivative_predictor,infinite_motif_predictor):
-        self.x0_range = x0_range
-        self.x0_finite_range = x0_finite_range
-        self.composition = composition
-        self.transition_point_predictor = transition_point_predictor
-        self.derivative_predictor = derivative_predictor
-        self.infinite_motif_predictor = infinite_motif_predictor
-        self.n_transition_points = len(transition_point_predictor) // 2
-
-
-    def _validate_X0(self,X0):
-        if np.any(X0 < self.x0_range[0]) or np.any(X0 > self.x0_range[1]):
-            raise ValueError(f'Initial conditions out of range: {X0} not in {self.x0_range}')
-
-    def predict_transition_point(self,X0,transition_point_index,coordinate,reduce=True):
-        self._validate_X0(X0)
-
-        is_scalar = np.isscalar(X0)
-
-        X0 = np.atleast_1d(X0)
-        if len(X0.shape) == 1:
-            X0 = X0.reshape(-1,1)
-
-        result = self.transition_point_predictor[(transition_point_index,coordinate)](X0).flatten()
-
-        if is_scalar and reduce:
-            return result[0]
-        else:
-            return result
-    
-    def predict_all_transition_points(self,X0,reduce=True):
-        self._validate_X0(X0)
-
-        is_scalar = np.isscalar(X0)
-
-        X0 = np.atleast_1d(X0)
-        if len(X0.shape) == 1:
-            X0 = X0.reshape(-1,1)
-
-        results = np.empty((X0.shape[0],self.n_transition_points,2),dtype=float)
-        for i in range(self.n_transition_points):
-            results[:,i,0] = self.transition_point_predictor[(i,'t')](X0).flatten()
-            results[:,i,1] = self.transition_point_predictor[(i,'x')](X0).flatten()
-
-        if is_scalar and reduce:
-            return results[0]
-        else:
-            return results
-        
-    def predict_derivative(self,X0,boundary,order,reduce=True):
-        self._validate_X0(X0)
-
-        is_scalar = np.isscalar(X0)
-
-        X0 = np.atleast_1d(X0)
-        if len(X0.shape) == 1:
-            X0 = X0.reshape(-1,1)
-
-        if self.derivative_predictor is None:
-            result = np.empty(X0.shape[0])
-            result.fill(np.nan)
-        else:
-            result = self.derivative_predictor[(boundary,order)](X0).flatten()
-
-        if is_scalar and reduce:
-            return result[0]
-        else:
-            return result
-        
-    def predict_infinite_motif_property(self,X0,property_index,reduce=True):
-        self._validate_X0(X0)
-
-        is_scalar = np.isscalar(X0)
-
-        X0 = np.atleast_1d(X0)
-        if len(X0.shape) == 1:
-            X0 = X0.reshape(-1,1)
-        
-        if self.infinite_motif_predictor is None:
-            result = np.empty(X0.shape[0])
-            result.fill(np.nan)
-        else:
-            result = self.infinite_motif_predictor[property_index](X0).flatten()
-
-        if is_scalar and reduce:
-            return result[0]
-        else:
-            return result
-        
-    def predict_all_infinite_motif_properties(self,X0,reduce=True):
-        self._validate_X0(X0)
-
-        is_scalar = np.isscalar(X0)
-
-        X0 = np.atleast_1d(X0)
-        if len(X0.shape) == 1:
-            X0 = X0.reshape(-1,1)
-
-        if self.infinite_motif_predictor is None:
-            results = np.empty((X0.shape[0],1))
-            results.fill(np.nan)
-        else:
-            results = np.empty((X0.shape[0],len(self.infinite_motif_predictor)),dtype=float)
-            for i in range(len(self.infinite_motif_predictor)):
-                results[:,i] = self.infinite_motif_predictor[i](X0).flatten()
-        
-        if is_scalar and reduce:
-            return results[0]
-        else:
-            return results
-        
-    def visualize(self,layout):
-        if layout == '1d':
-            fig = plt.figure(figsize=(20,5))
-            self._visualize_1d_layout(fig)
-            plt.show()
-        elif layout == '2d':
-            self._visualize_2d_layout()
-        else:
-            print('Invalid layout')
-
-
-    def _visualize_1d_layout(self, fig):
-        n_cols = 4
-        n_rows = 1
-        axs = fig.subplots(n_rows,n_cols)
-
-        axs[0].set_title(r'Transition points ($t$-coordinates)')
-        axs[1].set_title(r'Transition points ($x$-coordinates)')
-        axs[2].set_title('Derivatives')
-
-        if len(self.infinite_motif_predictor) > 0:
-            motif_string = "s_{"+str(self.composition[-1])+"}"
-            axs[3].set_title(fr'Properties of unbounded motif ${motif_string}$')
-        else:
-            axs[3].set_title('Properties of unbounded motif')
-
-        axs[0].set_xlabel(r'$x_0$')
-        axs[1].set_xlabel(r'$x_0$')
-        axs[2].set_xlabel(r'$x_0$')
-        axs[3].set_xlabel(r'$x_0$')
-        
-        # for i in range(len(self.infinite_motif_predictor)):
-        #     axs[i//n_cols_infinite_motif,2+i%n_cols_infinite_motif].set_title(f'Property {i}')
-
-        x_space = np.linspace(self.x0_finite_range[0],self.x0_finite_range[1],100)
-
-        for i in range(self.n_transition_points):
-            axs[0].plot(x_space,self.predict_transition_point(x_space,i,'t'),label=fr"$t_{i}$")
-            axs[1].plot(x_space,self.predict_transition_point(x_space,i,'x'),label=fr"$x(t_{i})$")
-        axs[2].plot(x_space,self.predict_derivative(x_space,'start',1),label=r'$\dot{x}(t_{\text{start}})$')
-        axs[2].plot(x_space,self.predict_derivative(x_space,'end',1),label=r'$\dot{x}(t_{\text{end}})$')
-        axs[2].plot(x_space,self.predict_derivative(x_space,'end',2),label=r'$\ddot{x}(t_{\text{end}})$')
-
-        if len(self.infinite_motif_predictor) > 0:
-            # There is infinite motif
-            infinite_motif = self.composition[-1]
-            is_single = (len(self.composition) == 1)
-            motif_class = get_default_motif_class(infinite_motif)
-            property_names = motif_class.get_property_names()
-
-        for i in range(len(self.infinite_motif_predictor)):
-            # axs[i//n_cols_infinite_motif,2+i//n_rows_infinite_motif].plot(x_space,self.predict_infinite_motif_property(x_space,i))
-            axs[3].plot(x_space,self.predict_infinite_motif_property(x_space,i),label=property_names[i])
-        axs[0].legend()
-        axs[1].legend()
-        axs[2].legend()
-        axs[3].legend()
-
-        # Global title for the whole figure
-        fig.suptitle(f'Property map for composition {format_composition(self.composition)}',fontsize=16)
-
-        fig.subplots_adjust(top=0.8)
-
-        # fig.title(f'Property map for composition {self.format_composition(self.composition)}')
-        
-
-        
-    def _visualize_2d_layout(self):
-
-        if len(self.infinite_motif_predictor) == 0:
-            n_cols_infinite_motif = 0
-            n_rows_infinite_motif = 0
-        elif len(self.infinite_motif_predictor) <= 2:
-            n_cols_infinite_motif = 1
-            n_rows_infinite_motif = 2
-        else:
-            n_cols_infinite_motif = 2
-            n_rows_infinite_motif = (len(self.infinite_motif_predictor)+1) // 2
-
-        # n_rows  = max(2,n_rows_infinite_motif)
-        # n_cols = 2 + n_cols_infinite_motif  
-        n_rows = 2
-        n_cols = 2
-        fig, axs = plt.subplots(n_rows,n_cols,figsize=(n_cols*5,n_rows*4))
-
-        axs[0,0].set_title(r'Transition points ($t$-coordinates)')
-        axs[1,0].set_title(r'Transition points ($x$-coordinates)')
-        axs[0,1].set_title('Derivatives')
-
-        if len(self.infinite_motif_predictor) > 0:
-            motif_string = "s_{"+str(self.composition[-1])+"}"
-            axs[1,1].set_title(fr'Properties of unbounded motif ${motif_string}$')
-        else:
-            axs[1,1].set_title('Properties of unbounded motif')
-
-        axs[0,0].set_xlabel(r'$x_0$')
-        axs[0,1].set_xlabel(r'$x_0$')
-        axs[1,0].set_xlabel(r'$x_0$')
-        axs[1,1].set_xlabel(r'$x_0$')
-        
-        # for i in range(len(self.infinite_motif_predictor)):
-        #     axs[i//n_cols_infinite_motif,2+i%n_cols_infinite_motif].set_title(f'Property {i}')
-
-        x_space = np.linspace(self.x0_finite_range[0],self.x0_finite_range[1],100)
-
-        for i in range(self.n_transition_points):
-            axs[0,0].plot(x_space,self.predict_transition_point(x_space,i,'t'),label=fr"$t_{i}$")
-            axs[1,0].plot(x_space,self.predict_transition_point(x_space,i,'x'),label=fr"$x(t_{i})$")
-        axs[0,1].plot(x_space,self.predict_derivative(x_space,'start',1),label=r'$\dot{x}(t_{\text{start}})$')
-        axs[0,1].plot(x_space,self.predict_derivative(x_space,'end',1),label=r'$\dot{x}(t_{\text{end}})$')
-        axs[0,1].plot(x_space,self.predict_derivative(x_space,'end',2),label=r'$\ddot{x}(t_{\text{end}})$')
-
-        if len(self.infinite_motif_predictor) > 0:
-            # There is infinite motif
-            infinite_motif = self.composition[-1]
-            is_single = (len(self.composition) == 1)
-            motif_class = get_default_motif_class(infinite_motif)
-            property_names = motif_class.get_property_names()
-
-        for i in range(len(self.infinite_motif_predictor)):
-            # axs[i//n_cols_infinite_motif,2+i//n_rows_infinite_motif].plot(x_space,self.predict_infinite_motif_property(x_space,i))
-            axs[1,1].plot(x_space,self.predict_infinite_motif_property(x_space,i),label=property_names[i])
-        axs[0,0].legend()
-        axs[1,0].legend()
-        axs[0,1].legend()
-        axs[1,1].legend()
-        plt.show()
-        
-
-        
 
 class SemanticPredictor:
 
@@ -587,7 +247,7 @@ class SemanticPredictor:
             for j in range(X0_filtered.shape[0]):
                 semantic_representations.append(SemanticRepresentation(self.t_range,composition,transition_points[j],derivative_start[j],derivative_end[j],properties_infinite_motif[j],second_derivative_end[j]))
 
-            _assign_to_mask(mask,results,semantic_representations)
+            utils.assign_to_mask(mask,results,semantic_representations)
 
         if is_scalar and reduce:
             return results[0]
@@ -666,9 +326,9 @@ class SemanticPredictor:
             else:
                 x0_print_2 = f"{x0_range[1]:.2f}"
             if x0_range[1] == np.inf:
-                ax.set_title(rf'{format_composition(composition)} if $'+x0_print_1+rf'< x_0 < '+x0_print_2+'$', fontsize=14)
+                ax.set_title(rf'{utils.format_composition(composition)} if $'+x0_print_1+rf'< x_0 < '+x0_print_2+'$', fontsize=14)
             else:
-                ax.set_title(rf'{format_composition(composition)} if $'+x0_print_1+rf'< x_0 \leq '+x0_print_2+'$', fontsize=14)  
+                ax.set_title(rf'{utils.format_composition(composition)} if $'+x0_print_1+rf'< x_0 \leq '+x0_print_2+'$', fontsize=14)  
             # Add space between the title and the plot
 
             self._visualize_composition(ax,i,finite_t_range, False)
@@ -734,6 +394,9 @@ class SemanticODE:
         self.composition_map = None
         self.torch_models = None
 
+        self.torch_device = utils.get_torch_device(self.config['device'])
+        self.lightning_accelerator = utils.get_lightning_accelerator(self.config['device'])
+
     def _get_updated_opt_config(self,opt_config):
         config = self._get_default_opt_config()
         for key, value in opt_config.items():
@@ -751,7 +414,7 @@ class SemanticODE:
         Returns:
         tuple of torch tensors
         """
-        return tuple([torch.tensor(arg, dtype=torch.float32, device=self.config['device']) for arg in args])
+        return tuple([torch.tensor(arg, dtype=torch.float32, device=self.torch_device) for arg in args])
     
     def _finite_x0_range(self,prev_x0,next_x0):
         """
@@ -855,26 +518,6 @@ class SemanticODE:
             with multiprocessing.Pool() as p:
                 composition_scores = list(tqdm(p.imap(process_sample, info), total=n_samples))
         
-        # Fit every sample with the neighbouring samples
-        # ------------------------------------------------
-        # composition_scores = {'x0':[]}
-        # for composition in self.composition_library:
-        #     composition_scores[tuple(composition)] = []
-        # for i in tqdm(range(n_samples)):
-        #     middle = (X0[i][0], T[i], Y[i])
-        #     composition_scores['x0'].append(middle[0])
-        #     if i > 0 and i < n_samples-1:
-        #         # We have a previous and a next sample
-        #         before = (X0[i-1][0], T[i-1], Y[i-1])
-        #         after = (X0[i+1][0], T[i+1], Y[i+1])
-        #         for composition in self.composition_library:
-        #             loss, model = calculate_loss_3_samples(composition, self.config['t_range'], before, middle, after, seed=self.config['seed'])
-        #             composition_scores[tuple(composition)].append(loss)
-        #     else:
-        #         for composition in self.composition_library:
-        #             loss, model = calculate_loss(composition, self.config['t_range'], middle[0], middle[1], middle[2], seed=self.config['seed'])
-        #             composition_scores[tuple(composition)].append(loss)
-        
         # Create a dataframe
         composition_scores_df = pd.DataFrame(composition_scores)
 
@@ -905,7 +548,7 @@ class SemanticODE:
 
         # Set x-axis labels to be the column names
 
-        x_labels = [format_composition(column_name) for column_name in df.columns[1:]]
+        x_labels = [utils.format_composition(column_name) for column_name in df.columns[1:]]
         ax.set_xticks(np.arange(len(x_labels)) + 0.5)
         ax.set_xticklabels(x_labels, rotation=45, ha='right')
 
@@ -930,7 +573,7 @@ class SemanticODE:
         composition_scores_df = self._compute_composition_scores_df(X0,T,Y)
         self.composition_scores_df = composition_scores_df
 
-        branches = self._solve_branching_problem(composition_scores_df)
+        branches = solve_branching_problem(composition_scores_df, self.x0_range, self.max_branches)
         
         composition_map_list = []
         for branch_id in range(len(branches)-1):
@@ -1036,99 +679,7 @@ class SemanticODE:
         print(f"Semantic predictor fitted with validation loss: {loss}")
 
 
-    def _solve_branching_problem(self, df):
-
-        MIN_BRANCH_LENGTH = 0.1 * (self.x0_range[1] - self.x0_range[0])
-        # MIN_SAMPLES = int(0.1 * df.shape[0])
-        MIN_SAMPLES = 2
-
-        # create a matrix of Cell objects with the same shape as the input dataframe
-        x0 = df['x0'].values
-        df = df.drop(columns=['x0'])
-        cells = np.empty(df.shape, dtype=object)
-        for i in range(df.shape[0]):
-            for j in range(df.shape[1]):
-                cells[i,j] = Cell()
-        
-        row_index = cells.shape[0] - 1 # start from the last row
-        for j in range(cells.shape[1]):
-            cells[row_index,j].total_loss[0] = df.iloc[row_index,j]
-            cells[row_index,j].next_composition[0] = None
-            cells[row_index,j].samples_without_change[0] = 1
-            cells[row_index,j].x0_without_change[0] = 0.0
-            for k in range(1,self.max_branches):
-                # As it is the last row we cannot have more than 0 changes
-                cells[row_index,j].total_loss[k] = np.inf
-                cells[row_index,j].next_composition[k] = None
-                cells[row_index,j].samples_without_change[k] = 1 # this should never be used
-                cells[row_index,j].x0_without_change[k] = 0.0 # this should never be used
-
-        for i in range(1,cells.shape[0]):
-            row_index = cells.shape[0] - i - 1
-            for j in range(cells.shape[1]):
-                # For exactly 0 changes
-                cells[row_index,j].total_loss[0] = df.iloc[row_index,j] + cells[row_index+1,j].total_loss[0]
-                cells[row_index,j].next_composition[0] = j
-                cells[row_index,j].samples_without_change[0] = cells[row_index+1,j].samples_without_change[0] + 1
-                cells[row_index,j].x0_without_change[0] = cells[row_index+1,j].x0_without_change[0] + x0[row_index+1] - x0[row_index]
-                for k in range(1,self.max_branches):
-                    # For exactly k changes
-                    min_loss = np.inf
-                    min_composition_id = None
-                    for l in range(cells.shape[1]):
-                        if l == j:
-                            # Stay in the same composition
-                            if cells[row_index+1,l].total_loss[k] < min_loss:
-                                min_loss = cells[row_index+1,l].total_loss[k]
-                                min_composition_id = l
-                        else:
-                            # Switch to a different composition
-                            if cells[row_index+1,l].samples_without_change[k-1] < MIN_SAMPLES:
-                                # We need at least MIN_SAMPLES samples without change to switch
-                                continue
-                            if row_index < MIN_SAMPLES - 1:
-                                # We are in the first rows, we cannot switch yet (we need MIN_SAMPLES samples without change)
-                                continue 
-                            if cells[row_index+1,l].x0_without_change[k-1] < MIN_BRANCH_LENGTH:
-                                # We need to have a minimum branch length
-                                continue
-                            if x0[row_index] - x0[0] < MIN_BRANCH_LENGTH:
-                                # We need to have a minimum branch length
-                                continue
-                            if cells[row_index+1,l].total_loss[k-1] < min_loss:
-                                min_loss = cells[row_index+1,l].total_loss[k-1]
-                                min_composition_id = l
-                    cells[row_index,j].total_loss[k] = df.iloc[row_index,j] + min_loss
-                    cells[row_index,j].next_composition[k] = min_composition_id
-                    cells[row_index,j].samples_without_change[k] = 1 if min_composition_id != j else cells[row_index+1,min_composition_id].samples_without_change[k] + 1
-                    cells[row_index,j].x0_without_change[k] = 0.0 if min_composition_id != j else cells[row_index+1,min_composition_id].x0_without_change[k] + x0[row_index+1] - x0[row_index]
-        # find the branching with the lowest loss
-        branches = []
-        min_loss = np.inf
-        min_composition_id = None
-        min_n_changes = None
-        for j in range(cells.shape[1]):
-            for k in range(self.max_branches):
-                if cells[0,j].total_loss[k] < min_loss:
-                    min_loss = cells[0,j].total_loss[k]
-                    min_composition_id = j
-                    min_n_changes = k
-        branches.append((-np.inf, df.columns[min_composition_id]))
-
-        previous_composition_id = min_composition_id
-        previous_n_changes = min_n_changes
-
-        for i in range(1,cells.shape[0]):
-            next_composition_id = cells[i-1,previous_composition_id].next_composition[previous_n_changes]
-            if next_composition_id is None:
-                break # we got to the end of the matrix
-            if next_composition_id != previous_composition_id:
-                # we have a switch
-                branches.append((x0[i-1], df.columns[next_composition_id]))
-                previous_composition_id = next_composition_id
-                previous_n_changes = previous_n_changes - 1
-        
-        return branches
+    
 
     def _construct_single_property_map(self,x0_range,composition,torch_model):
         n_motifs = len(composition)
@@ -1335,7 +886,7 @@ class SemanticODE:
             'devices': 1,
             'enable_model_summary': False,
             'enable_progress_bar': False,
-            'accelerator': self.config['device'],
+            'accelerator': self.lightning_accelerator,
             'max_epochs': self.config['n_epochs'] if not refit else self.config['n_epochs']*5,
             'check_val_every_n_epoch': 2,
             'log_every_n_steps': 1,
@@ -1431,7 +982,7 @@ class SemanticODE:
                 'devices': 1,
                 'enable_model_summary': False,
                 'enable_progress_bar': False,
-                'accelerator': self.config['device'],
+                'accelerator': self.lightning_accelerator,
                 'max_epochs': self.config['n_epochs'] if not refit else self.config['n_epochs']*5,
                 'check_val_every_n_epoch': 5,
                 'log_every_n_steps': 1,

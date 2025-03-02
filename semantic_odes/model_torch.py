@@ -3,6 +3,7 @@ import torch.nn.functional as F
 from scipy.interpolate import BSpline
 import numpy as np
 from semantic_odes.infinite_motifs import *
+from semantic_odes import utils
 
 MIN_TRANSITION_POINT_SEP = 1e-1
 # MIN_PROPERTY_VALUE = 1e-3
@@ -34,17 +35,15 @@ class CubicModel(torch.nn.Module):
 
         self.fixed_infinite_properties = fixed_infinite_properties
 
-        if config['device'] == 'gpu' or config['device'] == 'cuda':
-            self.device = torch.device('cuda')
-        else:
-            self.device = torch.device('cpu')
+        self.torch_device = utils.get_torch_device(config['device'])
 
         if config['t_range'][1] is None:
-            self.t_range = torch.Tensor([config['t_range'][0],np.inf]).to(self.device)
+            self.t_range = torch.Tensor([config['t_range'][0],np.inf]).to(self.torch_device)
         else:
-            self.t_range = torch.Tensor([config['t_range'][0],config['t_range'][1]]).to(self.device)
+            self.t_range = torch.Tensor([config['t_range'][0],config['t_range'][1]]).to(self.torch_device)
         torch.manual_seed(self.seed)
-        if self.composition[-1][-1] != 'c':
+
+        if utils.is_unbounded_composition(self.composition):
             # it is an infinite composition
             self.composition_finite_part = self.composition[:-1]
             self.infinite_motif = self.composition[-1]
@@ -57,7 +56,6 @@ class CubicModel(torch.nn.Module):
 
         self.scalers = {}
 
-        # self.weights = torch.nn.Parameter(torch.randn(self.n_basis_functions, self.n_coordinates))
         self.horizontal_weights = torch.nn.Parameter(torch.randn(self.n_basis_functions, len(self.composition_finite_part)))
         self.vertical_weights = torch.nn.Parameter(torch.randn(self.n_basis_functions, len(self.composition_finite_part)))
 
@@ -72,55 +70,52 @@ class CubicModel(torch.nn.Module):
                 self.infinite_motif_start_weights = torch.nn.Parameter(torch.randn(self.n_basis_functions, 1))
                 self.scalers['infinite_motif_start'] = torch.nn.Parameter(torch.randn(1))
 
-        if self.composition[0][2] == 'c':
-            # if the first motif is finite we have an additional degree of freedom
-            # for the first derivative at the start
+        self.first_derivative_at_start_status = utils.get_first_derivative_at_start_status(self.composition)
+        self.first_derivative_at_end_status = utils.get_first_derivative_at_end_status(self.composition)
+        self.second_derivative_at_end_status = utils.get_second_derivative_at_end_status(self.composition)
+
+        if self.first_derivative_at_start_status == 'weights':
             self.first_derivative_at_start = torch.nn.Parameter(torch.randn(self.n_basis_functions, 1))
-
-            self.specified_first_derivative_at_start = True
-        else:
-            self.specified_first_derivative_at_start = False
-
-        if self.composition[-1][2] == 'c' and len(self.composition) != 1:
-            # if the last motif is finite (and it's not the only motif) we have an additional degree of freedom
-            # for the first derivative at the end
-            # with infinite composition, this is not needed as the last finite transition point is always an extremum or transition point
+        
+        if self.first_derivative_at_end_status == 'weights':
             self.first_derivative_at_end = torch.nn.Parameter(torch.randn(self.n_basis_functions, 1))
-            self.specified_first_derivative_at_end = True
-            self.specified_second_derivative_at_end = False
-        elif self.infinite_composition and len(self.composition) == 1:
-            # if there is only one infinite motif, we need to specify the first derivative at the end
-            # and possibly the second as well
-            self.first_derivative_at_end = torch.nn.Parameter(torch.randn(self.n_basis_functions, 1))
-            self.specified_first_derivative_at_end = True
-            second_derivative_vanishes = self.infinite_motif_classes[self.infinite_motif].second_derivative_vanishes()
-            if not second_derivative_vanishes:
-                self.second_derivative_at_end = torch.nn.Parameter(torch.randn(self.n_basis_functions, 1))
-                self.specified_second_derivative_at_end = True
-            else:
-                self.specified_second_derivative_at_end = False
-        else:
-            self.specified_first_derivative_at_end = False
-            self.specified_second_derivative_at_end = False
+        
+        if self.second_derivative_at_end_status == 'weights':
+            self.second_derivative_at_end = torch.nn.Parameter(torch.randn(self.n_basis_functions, 1))
 
         for key, value in self.scalers.items():
             if key in ['vertical', 'infinite_motif_start']:
-                self.scalers[key] = torch.ones_like(value, requires_grad=False).to(self.device)
+                self.scalers[key] = torch.ones_like(value, requires_grad=False).to(self.torch_device)
         
         self.scalers = torch.nn.ParameterDict(self.scalers)
 
-
-
     def number_of_properties_for_infinite_motif(self):
+        """
+        Returns the number of properties for the infinite motif
+
+        Returns:
+        num_properties: number of properties for the infinite motif
+        """
         if not self.infinite_composition:
             return 0
         else:
             return self.infinite_motif_classes[self.infinite_motif].num_network_properties()
             
-    def extract_first_derivative_at_start(self,X,B):
-        if self.specified_first_derivative_at_start:
+    def extract_first_derivative_at_start(self,X,B, finite_coordinates=None):
+        """
+        Extracts the first derivative at the start of the composition
 
-            finite_coordinates = self.extract_coordinates_finite_composition(X, B) # shape (batch_size, n_all_coordinates, 2)
+        Args:
+        X: input tensor of shape (batch_size, 1)
+        B: input tensor of shape (batch_size, n_basis_functions)
+        finite_coordinates: input tensor of shape (batch_size, n_finite_coordinates, 2)
+
+        Returns:
+        first_derivative_at_start: tensor of shape (batch_size,)
+        """
+        if self.first_derivative_at_start_status == 'weights':
+            if finite_coordinates is None:
+                finite_coordinates = self.extract_coordinates_finite_composition(X, B) # shape (batch_size, n_all_coordinates, 2)
 
             motif_index = 0
             coordinate_1 = finite_coordinates[:,motif_index,:]
@@ -129,81 +124,105 @@ class CubicModel(torch.nn.Module):
             calculated_first_derivative_ratio = torch.sigmoid(B @ self.first_derivative_at_start).flatten()
             slope_min, slope_max = self.get_first_derivative_range(0, coordinate_1, coordinate_2, "left")
             return slope_min + calculated_first_derivative_ratio * (slope_max - slope_min)
-                
         else:
             return None
         
-    def extract_first_derivative_at_end(self,X,B):
+    def extract_first_derivative_at_end(self,X,B, all_coefficients=None, finite_coordinates=None):
+        """
+        Extracts the first derivative at the end of the finite composition
 
-        if self.composition[0][2] == 'c':
-            # there is at least one finite motif
+        Args:
+        X: input tensor of shape (batch_size, 1)
+        B: input tensor of shape (batch_size, n_basis_functions)
+        all_coefficients: input tensor of shape (batch_size, n_cubics, 4)
+        finite_coordinates: input tensor of shape (batch_size, n_finite_coordinates, 2)
 
-            if self.type_of_transition_point(len(self.composition_finite_part)) == 'max' or self.type_of_transition_point(len(self.composition_finite_part)) == 'min':
-                return torch.zeros(X.shape[0]).to(self.device)
+        Returns:
+        first_derivative_at_end: tensor of shape (batch_size,)
+        """
 
-            all_coefficients, finite_coordinates = self.get_coefficients_and_coordinates_finite_composition(X, B)
+        if self.first_derivative_at_end_status == 'zero':
+            return torch.zeros(X.shape[0]).to(self.torch_device)
+        elif self.first_derivative_at_end_status == 'cubic':
+            if (all_coefficients is None) or (finite_coordinates is None):
+                all_coefficients, finite_coordinates = self.get_coefficients_and_coordinates_finite_composition(X, B)
             last_transition_point = finite_coordinates[:,-1,:]
 
             last_first_derivative = 3*all_coefficients[:,-1,0] * last_transition_point[:,0]**2 + 2 * all_coefficients[:,-1,1] * last_transition_point[:,0] + all_coefficients[:,-1,2]
             return last_first_derivative
-        elif self.specified_first_derivative_at_end:
-            if self.infinite_composition and len(self.composition) == 1:
+        elif self.first_derivative_at_end_status == 'weights':
+            if utils.is_unbounded_composition(self.composition):
                 sign = 1 if self.composition[-1][0] == '+' else -1
                 return sign * torch.nn.functional.softplus(B @ self.first_derivative_at_end)
             else:
-                pass
-                # TODO: implement this for finite compositions
+                if finite_coordinates is None:
+                    finite_coordinates = self.extract_coordinates_finite_composition(X, B)
+                motif_index = len(self.composition) - 1
+                coordinate_1 = finite_coordinates[:,motif_index,:]
+                coordinate_2 = finite_coordinates[:,motif_index+1,:]
+                calculated_first_derivative_ratio = torch.sigmoid(B @ self.first_derivative_at_end).flatten()
+                slope_min, slope_max = self.get_first_derivative_range(motif_index, coordinate_1, coordinate_2, "right")
+                return slope_min + calculated_first_derivative_ratio * (slope_max - slope_min)
+        else:
+            return None
 
         
-    def extract_second_derivative_at_end(self,X,B):
-        if self.composition[0][2] == 'c':
-            # there is at least one finite motif
+    def extract_second_derivative_at_end(self,X,B, all_coefficients=None, finite_coordinates=None):
+        """
+        Extracts the second derivative at the end of the finite composition.
+        Parameters:
+        X (torch.Tensor): Input tensor of shape (batch_size, 1).
+        B (torch.Tensor): Input tensor of shape (batch_size, n_basis_functions).
+        all_coefficients (torch.Tensor, optional): input tensor of shape (batch_size, n_motifs, 4) Defaults to None.
+        finite_coordinates (torch.Tensor, optional): input tensor of shape (batch_size, n_all_coordinates, 2). Defaults to None.
+        Returns:
+        torch.Tensor: tensor of shape (batch_size,). The output depends on the status of 
+                      `self.second_derivative_at_end_status`:
+                      - 'zero': Returns a tensor of zeros with the same batch size as X.
+                      - 'cubic': Returns the second derivative computed using cubic coefficients.
+                      - 'weights': Returns the second derivative computed using weighted softplus function.
+                      - Otherwise: Returns None.
+        """
 
-            if self.type_of_transition_point(len(self.composition_finite_part)) == 'inflection':
-                return torch.zeros(X.shape[0]).to(self.device)
-
-            all_coefficients, finite_coordinates = self.get_coefficients_and_coordinates_finite_composition(X, B)
+        if self.second_derivative_at_end_status == 'zero':
+            return torch.zeros(X.shape[0]).to(self.torch_device)
+        elif self.second_derivative_at_end_status == 'cubic':
+            if (all_coefficients is None) or (finite_coordinates is None):
+                all_coefficients, finite_coordinates = self.get_coefficients_and_coordinates_finite_composition(X, B)
             last_transition_point = finite_coordinates[:,-1,:]
 
             last_second_derivative = 6*all_coefficients[:,-1,0] * last_transition_point[:,0] + 2 * all_coefficients[:,-1,1]
             return last_second_derivative
-        elif self.specified_second_derivative_at_end:
+        elif self.second_derivative_at_end_status == "weights":
             sign = 1 if self.composition[-1][1] == '+' else -1
             return sign * torch.nn.functional.softplus(B @ self.second_derivative_at_end)
         else:
-            return torch.zeros(X.shape[0]).to(self.device)
-
+            return None
     
     def extract_properties_infinite_motif(self, X, B, t_range):
+        """
+        Extracts properties for an infinite motif based on the input data and parameters.
+        Args:
+            X (torch.Tensor): Input tensor of shape (batch_size, 1).
+            B (torch.Tensor): Input tensor of shape (batch_size, n_basis_functions).
+            t_range (torch.Tensor): Tensor representing the range of time points.
+        Returns:
+            torch.Tensor: Tensor containing the properties of the infinite motif. Shape is (batch_size, num_properties).
+        Notes:
+            - If `self.infinite_composition` is False, returns a tensor of zeros with the appropriate shape.
+            - If `self.fixed_infinite_properties` is not None, updates the properties tensor using the provided property functions.
+        """
+
         if not self.infinite_composition:
-            return torch.zeros(X.shape[0], self.number_of_properties_for_infinite_motif()).to(self.device)
+            return torch.zeros(X.shape[0], self.number_of_properties_for_infinite_motif()).to(self.torch_device)
 
         properties = torch.nn.functional.softplus(B @ self.infinite_motif_properties_weights) * torch.nn.functional.softplus(self.scalers['infinite_motif_properties']) 
 
         all_coefficients, finite_coordinates = self.get_coefficients_and_coordinates_finite_composition(X, B)
         last_transition_point = finite_coordinates[:,-1,:]
 
-        infinite_motif_index = len(self.composition) - 1
-
-        if infinite_motif_index > 0:
-            if self.type_of_transition_point(len(self.composition_finite_part)) == 'inflection':
-                last_second_derivative = torch.zeros(X.shape[0]).to(self.device)
-            else:
-                last_second_derivative = 6*all_coefficients[:,[infinite_motif_index-1],0] * last_transition_point[:,[0]] + 2 * all_coefficients[:,[infinite_motif_index-1],1]
-            if self.type_of_transition_point(len(self.composition_finite_part)) == 'max' or self.type_of_transition_point(len(self.composition_finite_part)) == 'min':
-                last_first_derivative = torch.zeros(X.shape[0]).to(self.device)
-            else:
-                last_first_derivative = 3*all_coefficients[:,[infinite_motif_index-1],0] * last_transition_point[:,[0]]**2 + 2 * all_coefficients[:,[infinite_motif_index-1],1] * last_transition_point[:,[0]] + all_coefficients[:,[infinite_motif_index-1],2]
-        else:
-            # there is only one motif
-            sign = 1 if self.composition[-1][0] == '+' else -1
-            last_first_derivative = sign * torch.nn.functional.softplus(B @ self.first_derivative_at_end)
-            if self.specified_second_derivative_at_end:
-                sign = 1 if self.composition[-1][1] == '+' else -1
-                last_second_derivative = sign * torch.nn.functional.softplus(B @ self.second_derivative_at_end)
-            else:
-                last_second_derivative = torch.zeros(X.shape[0]).to(self.device)
-            
+        last_first_derivative = self.extract_first_derivative_at_end(X, B, all_coefficients, finite_coordinates).reshape(-1,1)
+        last_second_derivative = self.extract_second_derivative_at_end(X, B, all_coefficients, finite_coordinates).reshape(-1,1)
 
         x0 = last_transition_point[:,[0]]
         y0 = last_transition_point[:,[1]]
@@ -217,6 +236,16 @@ class CubicModel(torch.nn.Module):
         return result
     
     def extract_coordinates_finite_composition(self, X, B):
+        """
+        Extracts the coordinates of the finite composition based on X and B.
+
+        Args:
+        X: input tensor of shape (batch_size, 1)
+        B: input tensor of shape (batch_size, n_basis_functions)
+
+        Returns:
+        all_coordinate_values: tensor of shape (batch_size, n_all_coordinates, 2)
+        """
 
         if self.infinite_composition:
             if len(self.composition) > 1:
@@ -224,20 +253,20 @@ class CubicModel(torch.nn.Module):
                 empirical_range = self.t_range[1] - self.t_range[0]
                 t_last_finite_transition_point = self.t_range[0] + MIN_TRANSITION_POINT_SEP + torch.sigmoid(t_last_finite_transition_point) * (1-MIN_RELATIVE_DISTANCE_TO_LAST_FINITE_TRANSITION_POINT) * empirical_range
             else:
-                t_last_finite_transition_point = self.t_range[0] * torch.ones(X.shape[0]).to(self.device)
+                t_last_finite_transition_point = self.t_range[0] * torch.ones(X.shape[0]).to(self.torch_device)
         else:
-            t_last_finite_transition_point = self.t_range[1] * torch.ones(X.shape[0]).to(self.device)
+            t_last_finite_transition_point = self.t_range[1] * torch.ones(X.shape[0]).to(self.torch_device)
 
         calculated_values_horizontal = (B @ self.horizontal_weights)
         calculated_values_vertical = (B @ self.vertical_weights)
 
 
-        all_coordinate_values = torch.zeros(X.shape[0], len(self.composition_finite_part)+1,2).to(self.device)
+        all_coordinate_values = torch.zeros(X.shape[0], len(self.composition_finite_part)+1,2).to(self.torch_device)
 
         # pass horizontal values through a softmax function, and scale them by the range of the time points
         scale = t_last_finite_transition_point - self.t_range[0]
 
-        calculated_values_horizontal = F.softmax(calculated_values_horizontal, dim=1) * (scale.reshape(-1,1).to(self.device))
+        calculated_values_horizontal = F.softmax(calculated_values_horizontal, dim=1) * (scale.reshape(-1,1).to(self.torch_device))
 
         # make sure vertical values are positive
         calculated_values_vertical = torch.nn.functional.softplus(calculated_values_vertical * self.scalers['vertical'])
@@ -258,120 +287,85 @@ class CubicModel(torch.nn.Module):
 
     def type_of_transition_point(self, ind):
         composition = self.composition
-        if ind == 0:
-            return 'start'
-        elif ind == len(composition):
-            return 'end'
-        else:
-            if (composition[ind-1][:2] == "++") and (composition[ind][:2] == "+-"):
-                return 'inflection'
-            elif (composition[ind-1][:2] == "+-") and (composition[ind][:2] == "++"):
-                return 'inflection'
-            elif (composition[ind-1][:2] == "+-") and (composition[ind][:2] == "--"):
-                return 'max'
-            elif (composition[ind-1][:2] == "-+") and (composition[ind][:2] == "++"):
-                return 'min'
-            elif (composition[ind-1][:2] == "-+") and (composition[ind][:2] == "--"):
-                return 'inflection'
-            elif (composition[ind-1][:2] == "--") and (composition[ind][:2] == "-+"):
-                return 'inflection'
-            else:
-                raise ValueError('Unknown transition point type')
+        return utils.type_of_transition_point(composition, ind)
+      
 
     def get_first_derivative_range(self, motif_index, point1, point2, which_point):
         slope = (point2[:,1] - point1[:,1])/(point2[:,0] - point1[:,0])
-        motif = self.composition[motif_index]
+        coefficients = utils.get_first_derivative_range_coefficients(self.composition, motif_index, which_point)
+        return coefficients[0] * slope, coefficients[1] * slope
+    
+    def _create_row(self, coordinate, order):
+        """
+        Creates a row to determine the coefficients of the cubic
 
-        if which_point == 'left':
-            if motif == '++c':
-                if self.type_of_transition_point(motif_index+1) == 'end':
-                    return torch.zeros_like(slope).to(self.device), slope
-                elif self.type_of_transition_point(motif_index+1) == 'inflection':
-                    return torch.zeros_like(slope).to(self.device), slope
-            elif motif == "+-c":
-                if self.type_of_transition_point(motif_index+1) == 'end':
-                    return slope, 2 * slope
-                elif self.type_of_transition_point(motif_index+1) == 'max':
-                    return 1.5 * slope, 3 * slope
-                elif self.type_of_transition_point(motif_index+1) == 'inflection':
-                    return slope, 3 * slope
-            elif motif == "-+c":
-                if self.type_of_transition_point(motif_index+1) == 'end':
-                    return slope, 2 * slope
-                elif self.type_of_transition_point(motif_index+1) == 'min':
-                    return 1.5 * slope, 3 * slope
-                elif self.type_of_transition_point(motif_index+1) == 'inflection':
-                    return slope, 3 * slope
-            elif motif == "--c":
-                if self.type_of_transition_point(motif_index+1) == 'end':
-                    return torch.zeros_like(slope).to(self.device), slope
-                elif self.type_of_transition_point(motif_index+1) == 'inflection':
-                    return torch.zeros_like(slope).to(self.device), slope
-        
-        elif which_point == 'right':
-            if motif == '++c':
-                if self.type_of_transition_point(motif_index) == 'inflection':
-                    return slope, 3*slope
-                elif self.type_of_transition_point(motif_index) == 'min':
-                    return 1.5 * slope, 3 * slope
-            elif motif == "+-c":
-                if self.type_of_transition_point(motif_index) == 'inflection':
-                    return torch.zeros_like(slope).to(self.device), slope
-            elif motif == "-+c":
-                if self.type_of_transition_point(motif_index) == 'inflection':
-                    return torch.zeros_like(slope).to(self.device), slope
-            elif motif == "--c":
-                if self.type_of_transition_point(motif_index) == 'inflection':
-                    return slope, 3 * slope
-                elif self.type_of_transition_point(motif_index) == 'max':
-                    return 1.5 * slope, 3 * slope
+        Args:
+        coordinate: input tensor of shape (batch_size, 2)
+        order: order of the row (0, 1, 2)
+
+        Returns:
+        row: row tensor of shape (batch_size, 4)
+        """
+        batch_size = coordinate.shape[0]
+        if order == 0:
+            return torch.stack([coordinate[:,0]**3, coordinate[:,0]**2, coordinate[:,0], torch.ones(batch_size).to(self.torch_device)], dim=1)
+        elif order == 1:
+            return torch.cat([3*coordinate[:,[0]]**2, 2*coordinate[:,[0]], torch.ones(batch_size, 1).to(self.torch_device), torch.zeros(batch_size, 1).to(self.torch_device)], dim=1)
+        elif order == 2:
+            return torch.cat([6*coordinate[:,[0]], 2*torch.ones(batch_size, 1).to(self.torch_device), torch.zeros(batch_size, 1).to(self.torch_device), torch.zeros(batch_size, 1).to(self.torch_device)], dim=1)
                 
-        # in general left of -a and right of +a are the same and vice versa.
                 
     def get_coefficients_and_coordinates_finite_composition(self, X, B):
+        """
+        Get the coefficients of the cubics
+
+        Args:
+        X: input tensor of shape (batch_size, 1)
+        B: input tensor of shape (batch_size, n_basis_functions)
+
+        Returns:
+        all_coefficients: tensor of shape (batch_size, n_cubics, 4)
+        finite_coordinates: tensor of shape (batch_size, n_finite_coordinates, 2)
+        """
 
         finite_coordinates = self.extract_coordinates_finite_composition(X, B) # shape (batch_size, n_all_coordinates, 2)
         
-        b = torch.zeros(X.shape[0], 3).to(self.device)
+        b = torch.zeros(X.shape[0], 3).to(self.torch_device)
         coefficients_list = []
 
         for motif_index, motif in enumerate(self.composition_finite_part):
             coordinate_1 = finite_coordinates[:,motif_index,:]
             coordinate_2 = finite_coordinates[:,motif_index+1,:]
 
-            A_row_0 = torch.stack([coordinate_1[:,0]**3, coordinate_1[:,0]**2, coordinate_1[:,0], torch.ones(X.shape[0]).to(self.device)], dim=1)
-            A_row_1 = torch.stack([coordinate_2[:,0]**3, coordinate_2[:,0]**2, coordinate_2[:,0], torch.ones(X.shape[0]).to(self.device)], dim=1)
+            A_row_0 = self._create_row(coordinate_1, 0)
+            A_row_1 = self._create_row(coordinate_2, 0)
             b_0 = coordinate_1[:,1]
             b_1 = coordinate_2[:,1]
 
             type_1 = self.type_of_transition_point(motif_index)
             type_2 = self.type_of_transition_point(motif_index+1)
             if type_1 == 'max' or type_1 == 'min':
-                A_row_2 = torch.cat([3*coordinate_1[:,[0]]**2, 2*coordinate_1[:,[0]], torch.ones(X.shape[0], 1).to(self.device), torch.zeros(X.shape[0], 1).to(self.device)], dim=1)
-                b_2 = torch.zeros(X.shape[0]).to(self.device)
+                A_row_2 = self._create_row(coordinate_1, 1)
+                b_2 = torch.zeros(X.shape[0]).to(self.torch_device)
             elif type_1 == 'inflection':
-                A_row_2 = torch.cat([6*coordinate_1[:,[0]], 2*torch.ones(X.shape[0], 1).to(self.device), torch.zeros(X.shape[0], 1).to(self.device), torch.zeros(X.shape[0], 1).to(self.device)], dim=1)
-                b_2 = torch.zeros(X.shape[0]).to(self.device)
-            elif type_1 == 'start' and self.specified_first_derivative_at_start:
-                A_row_2 = torch.cat([3*coordinate_1[:,[0]]**2, 2*coordinate_1[:,[0]], torch.ones(X.shape[0], 1).to(self.device), torch.zeros(X.shape[0], 1).to(self.device)], dim=1)
-                calculated_first_derivative_ratio = torch.sigmoid(B @ self.first_derivative_at_start).flatten()
-                slope_min, slope_max = self.get_first_derivative_range(motif_index, coordinate_1, coordinate_2, "left")
-                b_2 = slope_min + calculated_first_derivative_ratio * (slope_max - slope_min)
+                A_row_2 = self._create_row(coordinate_1, 2)
+                b_2 = torch.zeros(X.shape[0]).to(self.torch_device)
+            elif type_1 == 'start' and self.first_derivative_at_start_status == 'weights':
+                A_row_2 = self._create_row(coordinate_1, 1)
+                b_2 = self.extract_first_derivative_at_start(X,B,finite_coordinates)
                 if type_2 == 'end':
                     # in that case we reduce the cubic to a quadratic
-                    A_row_3 = torch.cat([torch.ones(X.shape[0],1), torch.zeros(X.shape[0], 1).to(self.device), torch.zeros(X.shape[0], 1).to(self.device), torch.zeros(X.shape[0], 1).to(self.device)], dim=1)
-                    b_3 = torch.zeros(X.shape[0]).to(self.device)
+                    A_row_3 = torch.cat([torch.ones(X.shape[0],1), torch.zeros(X.shape[0], 1), torch.zeros(X.shape[0], 1), torch.zeros(X.shape[0], 1)], dim=1).to(self.torch_device)
+                    b_3 = torch.zeros(X.shape[0]).to(self.torch_device)
             if type_2 == 'max' or type_2 == 'min':
-                A_row_3 = torch.cat([3*coordinate_2[:,[0]]**2, 2*coordinate_2[:,[0]], torch.ones(X.shape[0], 1).to(self.device), torch.zeros(X.shape[0], 1).to(self.device)], dim=1)
-                b_3 = torch.zeros(X.shape[0]).to(self.device)
+                A_row_3 = self._create_row(coordinate_2, 1)
+                b_3 = torch.zeros(X.shape[0]).to(self.torch_device)
             elif type_2 == 'inflection':
-                A_row_3 = torch.cat([6*coordinate_2[:,[0]], 2*torch.ones(X.shape[0], 1).to(self.device), torch.zeros(X.shape[0], 1).to(self.device), torch.zeros(X.shape[0], 1).to(self.device)], dim=1)
-                b_3 = torch.zeros(X.shape[0]).to(self.device)
-            elif (type_2 == 'end' and self.specified_first_derivative_at_end) and type_1 != 'start':
-                A_row_3 = torch.cat([3*coordinate_2[:,[0]]**2, 2*coordinate_2[:,[0]], torch.ones(X.shape[0], 1).to(self.device), torch.zeros(X.shape[0], 1).to(self.device)], dim=1)
-                calculated_first_derivative_ratio = torch.sigmoid(B @ self.first_derivative_at_end).flatten()
-                slope_min, slope_max = self.get_first_derivative_range(motif_index, coordinate_1, coordinate_2, "right")
-                b_3 = slope_min + calculated_first_derivative_ratio * (slope_max - slope_min)
+                A_row_3 = self._create_row(coordinate_2, 2)
+                b_3 = torch.zeros(X.shape[0]).to(self.torch_device)
+            elif (type_2 == 'end' and self.first_derivative_at_end_status == 'weights') and type_1 != 'start':
+                A_row_3 = self._create_row(coordinate_2, 1)
+                b_3 = self.extract_first_derivative_at_end(X,B,finite_coordinates=finite_coordinates)
 
             A = torch.stack([A_row_0, A_row_1, A_row_2, A_row_3], dim=1)
             b = torch.stack([b_0, b_1, b_2, b_3], dim=1)
@@ -381,13 +375,13 @@ class CubicModel(torch.nn.Module):
                 # just connect with a line
                 slope = (coordinate_2[:,1] - coordinate_1[:,1])/(coordinate_2[:,0]-coordinate_1[:,0])
                 b = coordinate_1[:,1] - slope * coordinate_1[:,0]
-                coefficients = torch.stack([torch.zeros_like(b).to(self.device),torch.zeros_like(b).to(self.device),slope,b],dim=1)
+                coefficients = torch.stack([torch.zeros_like(b).to(self.torch_device),torch.zeros_like(b).to(self.torch_device),slope,b],dim=1)
             else:
                 coefficients = torch.linalg.solve(A, b)
             
             coefficients_list.append(coefficients)
         if len(coefficients_list) == 0:
-            all_coefficients = torch.zeros(X.shape[0], 0, 4).to(self.device)
+            all_coefficients = torch.zeros(X.shape[0], 0, 4).to(self.torch_device)
         else:
             all_coefficients = torch.stack(coefficients_list, dim=1) # shape (batch_size, n_motifs, 4)
         return all_coefficients, finite_coordinates
@@ -422,64 +416,8 @@ class CubicModel(torch.nn.Module):
         """
 
         all_coefficients, finite_coordinates = self.get_coefficients_and_coordinates_finite_composition(X, B)
-        knots = finite_coordinates[:,:,0]
-        last_transition_point = finite_coordinates[:,-1,:]
-        
-        if self.infinite_composition:
-            # add infinite knots
-            knots = torch.cat([knots, torch.from_numpy(np.array([np.inf])).reshape(1,1).repeat(X.shape[0],1).to(self.device)],dim=1)
-            properties = torch.nn.functional.softplus(B @ self.infinite_motif_properties_weights) * torch.nn.functional.softplus(self.scalers['infinite_motif_properties'])
-        else:
-            properties = None
-
-        Y_pred = torch.zeros(X.shape[0], T.shape[1]).to(self.device)
-
-        for i in range(len(self.composition)):
-            if self.composition[i][2] != 'c' and i > 0:
-                if self.type_of_transition_point(i) == 'min' or self.type_of_transition_point(i) == 'max':
-                    last_first_derivative = torch.zeros_like(X).to(self.device)
-                else:
-                    last_first_derivative = 3*all_coefficients[:,[i-1],0] * last_transition_point[:,[0]]**2 + 2 * all_coefficients[:,[i-1],1] * last_transition_point[:,[0]] + all_coefficients[:,[i-1],2]
-                
-                if self.type_of_transition_point(i) == 'inflection':
-                    last_second_derivative = torch.zeros_like(X).to(self.device)
-                else:
-                    last_second_derivative = 6*all_coefficients[:,[i-1],0] * last_transition_point[:,[0]] + 2 * all_coefficients[:,[i-1],1]
-            elif self.composition[i][2] != 'c' and i == 0:
-                sign = 1 if self.composition[-1][0] == '+' else -1
-                last_first_derivative = sign * torch.nn.functional.softplus(B @ self.first_derivative_at_end)
-                if self.specified_second_derivative_at_end:
-                    sign = 1 if self.composition[-1][1] == '+' else -1
-                    last_second_derivative = sign * torch.nn.functional.softplus(B @ self.second_derivative_at_end)
-                else:
-                    last_second_derivative = torch.zeros_like(X).to(self.device)
-            else:
-                last_first_derivative = None
-                last_second_derivative = None
-
-            if self.fixed_infinite_properties is not None:
-                x0 = last_transition_point[:,[0]]
-                y0 = last_transition_point[:,[1]]
-                y1 = last_first_derivative
-                y2 = last_second_derivative
-                for index, property_function in self.fixed_infinite_properties.items():
-                    properties[:,index] = property_function(X, x0, y0, y1, y2)
-            
-     
-            evaluated_piece = self.evaluate_piece(all_coefficients,properties,i,T,last_transition_point,last_first_derivative,last_second_derivative)
-
-            Y_pred += torch.where((knots[:,[i]].repeat(1,T.shape[1]) <= T) & (T < knots[:,[i+1]].repeat(1,T.shape[1])),evaluated_piece,0)
-        
-        if not self.infinite_composition:
-            # Due the sharp inequalities earlier, we need to add the last piece separately
-            a = all_coefficients[:,[-1],0].repeat(1,T.shape[1])
-            b = all_coefficients[:,[-1],1].repeat(1,T.shape[1])
-            c = all_coefficients[:,[-1],2].repeat(1,T.shape[1])
-            d = all_coefficients[:,[-1],3].repeat(1,T.shape[1])
-            Y_pred += torch.where(T == knots[:,[-1]].repeat(1,T.shape[1]),a*T**3 + b*T**2 + c*T + d,0)
-            # possibly add values beyond last t based on some condition, you can use first or second derivite information
-        
-        return Y_pred
+      
+        return self._forward(all_coefficients, finite_coordinates, X, B, T)
     
     def _forward(self, all_coefficients, finite_coordinates, X, B, T):
         """
@@ -496,33 +434,18 @@ class CubicModel(torch.nn.Module):
         
         if self.infinite_composition:
             # add infinite knots
-            knots = torch.cat([knots, torch.from_numpy(np.array([np.inf])).reshape(1,1).repeat(X.shape[0],1).to(self.device)],dim=1)
+            knots = torch.cat([knots, torch.from_numpy(np.array([np.inf])).reshape(1,1).repeat(X.shape[0],1).to(self.torch_device)],dim=1)
             properties = torch.nn.functional.softplus(B @ self.infinite_motif_properties_weights) * torch.nn.functional.softplus(self.scalers['infinite_motif_properties'])
         else:
             properties = None
 
-        Y_pred = torch.zeros(X.shape[0], T.shape[1]).to(self.device)
+        Y_pred = torch.zeros(X.shape[0], T.shape[1]).to(self.torch_device)
 
         for i in range(len(self.composition)):
-            if self.composition[i][2] != 'c' and i > 0:
-                if self.type_of_transition_point(i) == 'min' or self.type_of_transition_point(i) == 'max':
-                    last_first_derivative = torch.zeros_like(X).to(self.device)
-                else:
-                    last_first_derivative = 3*all_coefficients[:,[i-1],0] * last_transition_point[:,[0]]**2 + 2 * all_coefficients[:,[i-1],1] * last_transition_point[:,[0]] + all_coefficients[:,[i-1],2]
-                
-                if self.type_of_transition_point(i) == 'inflection':
-                    last_second_derivative = torch.zeros_like(X).to(self.device)
-                else:
-                    last_second_derivative = 6*all_coefficients[:,[i-1],0] * last_transition_point[:,[0]] + 2 * all_coefficients[:,[i-1],1]
-                
-            elif self.composition[i][2] != 'c' and i == 0:
-                sign = 1 if self.composition[-1][0] == '+' else -1
-                last_first_derivative = sign * torch.nn.functional.softplus(B @ self.first_derivative_at_end)
-                if self.specified_second_derivative_at_end:
-                    sign = 1 if self.composition[-1][1] == '+' else -1
-                    last_second_derivative = sign * torch.nn.functional.softplus(B @ self.second_derivative_at_end)
-                else:
-                    last_second_derivative = torch.zeros_like(X).to(self.device)
+
+            if utils.is_unbounded_composition(self.composition):
+                last_first_derivative = self.extract_first_derivative_at_end(X,B,all_coefficients,finite_coordinates).reshape(-1,1)
+                last_second_derivative = self.extract_second_derivative_at_end(X, B, all_coefficients, finite_coordinates).reshape(-1,1)
             else:
                 last_first_derivative = None
                 last_second_derivative = None

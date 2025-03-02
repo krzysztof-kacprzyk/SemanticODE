@@ -5,15 +5,7 @@ from scipy.optimize import minimize
 from scipy.interpolate import BSpline
 import matplotlib.pyplot as plt
 from semantic_odes.infinite_motifs import *
-
-def which_cubic(x, knots_x):
-    n_cubic = len(knots_x) - 1
-    for i in range(n_cubic):
-        if x >= knots_x[i] and x <= knots_x[i+1]: # both equalities are needed to account for edges
-            return i
-    return -1
-
-
+from semantic_odes import utils
 
 
 class Knot:
@@ -25,9 +17,15 @@ class Knot:
 
 
 class WrappedCubicSpline:
-
+    """
+    This class takes the semantic representation and certain parameters and constructs a cubic spline
+    that satisfies some constraints given by the semantic representation. The goal is to find the parameters such that
+    the cubic spline is as close as possible to the semantic representation. At the end we get the knots and the coefficients
+    of the cubic spline. We have two cubics per motif. We have "real" knots and "fake" knots. The real knots are the transition points
+    of the semantic representation. The "fake" or "additional" knots are between the transition points.
+    """
     def __init__(self, semantic_representation, epsilon=1e-9, epsilon_ratio=1e-6):
-        # print(semantic_representation)
+        
         self.composition = semantic_representation.composition
         self.transition_points = semantic_representation.coordinates_finite_composition # does not include the transition point at infinity
         self.parameters = None
@@ -41,7 +39,7 @@ class WrappedCubicSpline:
         self.factor = np.max(self.transition_points[:,1]) - np.min(self.transition_points[:,1])
         self.problem = False
 
-        if self.composition[-1][-1] != 'c':
+        if utils.is_unbounded_composition(self.composition):
             # it is an infinite composition
             self.composition_finite_part = self.composition[:-1]
             self.infinite_motif = self.composition[-1]
@@ -91,10 +89,7 @@ class WrappedCubicSpline:
             if knot_index != 0:
                 if self.knots[knot_index-1].transition_point is None:
                     self.fake_knots_y_determined.append(knot_index-1)
-        # for i, knot_index in enumerate(self.local_extrema_knots):
-        #     if i % 2 == 0:
-        #         if self.knots[knot_index-1].transition_point is None:
-        #             self.fake_knots_y_determined.append(knot_index-1)
+      
         if not self.infinite_composition and len(self.composition) > 1:
             # We have a derivative specified at the end
             # That means the fake knot before it is determined
@@ -129,29 +124,11 @@ class WrappedCubicSpline:
     
 
     def type_of_transition_point(self, ind):
+        # We want to treat the last finite transition point as the end
+        # because the derivatives at the end are specified either way
         composition = self.composition_finite_part
-        if ind == 0:
-            return 'start'
-        elif ind == len(composition):
-            # We treat the last finite transition point as the end
-            return 'end'
-        else:
-            if (composition[ind-1][:2] == "++") and (composition[ind][:2] == "+-"):
-                return 'inflection'
-            elif (composition[ind-1][:2] == "+-") and (composition[ind][:2] == "++"):
-                return 'inflection'
-            elif (composition[ind-1][:2] == "+-") and (composition[ind][:2] == "--"):
-                return 'max'
-            elif (composition[ind-1][:2] == "-+") and (composition[ind][:2] == "++"):
-                return 'min'
-            elif (composition[ind-1][:2] == "-+") and (composition[ind][:2] == "--"):
-                return 'inflection'
-            elif (composition[ind-1][:2] == "--") and (composition[ind][:2] == "-+"):
-                return 'inflection'
-            else:
-                raise ValueError('Unknown transition point type')
-
-            
+        return utils.type_of_transition_point(composition, ind) 
+        
 
     def set_parameters(self, parameters):
 
@@ -215,7 +192,7 @@ class WrappedCubicSpline:
             return self.knots[knot_id].x
         
     def get_knot_y_2nd(self, knot_id):
-        # print(f"Getting knot y 2nd for knot {knot_id}")
+
         if knot_id in self.cached_knot_y_2nd:
             return self.cached_knot_y_2nd[knot_id]
         elif knot_id in self.knots_with_2nd_derivative_fixed:
@@ -492,39 +469,6 @@ class PredictiveModel:
        
         
         return y_pred
-    
-
-    def normalize_trajectory(self, semantic_representation):
-
-        # Copy the semantic representation
-        semantic_representation = semantic_representation.copy()
-
-        # Get the minimum and maximum values of the trajectory
-        coordinates = semantic_representation.coordinates_finite_composition
-        y_min = np.min(coordinates[:,1])
-        y_max = np.max(coordinates[:,1])
-
-        factor = 1/(y_max - y_min)
-
-        # Scale so that y_max - y_min = 1
-        coordinates[:,1] = (coordinates[:,1]) * factor
-
-        semantic_representation.coordinates_finite_composition = coordinates
-
-        # Scale the derivatives
-        derivative_start = semantic_representation.derivative_start
-        derivative_end = semantic_representation.derivative_end
-        second_derivative_end = semantic_representation.second_derivative_end
-
-        derivative_start = derivative_start * factor
-        derivative_end = derivative_end * factor
-        second_derivative_end = second_derivative_end * factor
-
-        semantic_representation.derivative_start = derivative_start
-        semantic_representation.derivative_end = derivative_end
-        semantic_representation.second_derivative_end = second_derivative_end
-
-        return semantic_representation, factor
 
     def compute_parameters(self):
 
@@ -728,7 +672,7 @@ class ApproximatePredictiveModel:
         self.semantic_representation = semantic_representation
         self.composition = semantic_representation.composition
 
-        if self.composition[-1][2] == 'c':
+        if not utils.is_unbounded_composition(self.composition):
             self.infinite_composition = False
             self.infinite_motif = None
         else:
@@ -751,25 +695,7 @@ class ApproximatePredictiveModel:
 
     def type_of_transition_point(self, ind):
         composition = self.composition
-        if ind == 0:
-            return 'start'
-        elif ind == len(composition):
-            return 'end'
-        else:
-            if (composition[ind-1][:2] == "++") and (composition[ind][:2] == "+-"):
-                return 'inflection'
-            elif (composition[ind-1][:2] == "+-") and (composition[ind][:2] == "++"):
-                return 'inflection'
-            elif (composition[ind-1][:2] == "+-") and (composition[ind][:2] == "--"):
-                return 'max'
-            elif (composition[ind-1][:2] == "-+") and (composition[ind][:2] == "++"):
-                return 'min'
-            elif (composition[ind-1][:2] == "-+") and (composition[ind][:2] == "--"):
-                return 'inflection'
-            elif (composition[ind-1][:2] == "--") and (composition[ind][:2] == "-+"):
-                return 'inflection'
-            else:
-                raise ValueError('Unknown transition point type')
+        return utils.type_of_transition_point(composition, ind)
             
 
     def get_coefficients_finite_composition(self):
@@ -851,6 +777,10 @@ class ApproximatePredictiveModel:
         Forward pass of the model
 
         Args:
+            t: np.array of floats or float
+        
+        Returns:
+            y_pred: np.array of floats or float
         """
 
         is_t_scalar = np.isscalar(t)

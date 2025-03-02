@@ -1,3 +1,7 @@
+# No Equations Needed: Learning System Dynamics Without Relying on Closed-Form ODEs
+
+This is the official repository for the paper "No Equations Needed: Learning System Dynamics Without Relying on Closed-Form ODEs"
+
 ## Dependencies
 You can install all required dependencies using conda and the following command
 ```
@@ -26,3 +30,20 @@ experiments/results/
 
 ## Figures and tables
 Jupyter notebooks used to create all figures and tables in the paper can be found in `experiments/analysis`.
+
+## Citation
+
+Kacprzyk, K., & van der Schaar, M. (2025). No Equations Needed: Learning System Dynamics Without Relying on Closed-Form ODEs. The Thirteenth International Conference on Learning Representations.
+
+
+```
+@inproceedings{Kacprzyk.NoEquationsNeeded.2025,
+  title = {No {{Equations Needed}}: {{Learning System Dynamics Without Relying}} on {{Closed-Form ODEs}}},
+  shorttitle = {No {{Equations Needed}}},
+  booktitle = {The {{Thirteenth International Conference}} on {{Learning Representations}}},
+  author = {Kacprzyk, Krzysztof and {van der Schaar}, Mihaela},
+  year = {2025},
+}
+```
+
+

@@ -509,3 +509,48 @@ def get_real_pharma_dataset(data_folder='data'):
     return Dataset('tacrolimus-real', xs, ts, ys)
 
 
+def get_bifurcation_dataset(n_samples, n_measurements, noise_std, seed):
+
+    initial_range = (-1, 2)
+    t_range = (0,5)
+
+    def dfdt(x,t, r=1):
+        return r*x - x**2
+
+
+    xs = np.linspace(initial_range[0],initial_range[1],n_samples).reshape(-1,1)       
+    ts = np.stack([np.linspace(t_range[0],t_range[1],n_measurements) for _ in range(n_samples)], axis=0)
+
+    gen = np.random.default_rng(seed)
+    raw_ys = np.stack([odeint(dfdt, 1.0, ts[i], args=(xs[i][0],)).flatten() for i in range(n_samples)], axis=0)
+
+    # add noise
+    ys = raw_ys + gen.normal(0, noise_std, size=raw_ys.shape)
+
+    dataset_name = f"bifurcation_n={n_samples}_m={n_measurements}_noise={noise_std}"
+
+    return Dataset(dataset_name,xs, ts, ys)
+
+def get_pk_dataset_extrapolation_x0(n_samples, n_measurements, noise_std, seed):
+
+    tac = TacrolimusPK()
+    default_covariates = np.array([[10,10,1,80,20,16,60,1,0]])
+
+    v0 = np.linspace(21,30,n_samples)
+    t = np.linspace(0,24,n_measurements)
+
+    covariates = np.tile(default_covariates,(len(v0),1))
+    covariates[:,1] = v0
+
+    ys = np.stack([tac.predict(covariates[[i],:],t) for i in range(len(v0))],axis=0)/20
+    ts = np.tile(t,(len(v0),1))/24
+    xs = v0.reshape(-1,1)/20
+
+    # add noise
+    gen = np.random.default_rng(seed)
+    ys = ys + gen.normal(0, noise_std, size=ys.shape)
+
+    dataset_name = f"tacrolimus-extra-2_n={n_samples}_m={n_measurements}_noise={noise_std}"
+
+    return Dataset(dataset_name,xs, ts, ys)
+

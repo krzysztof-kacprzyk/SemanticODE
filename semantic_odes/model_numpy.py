@@ -1,49 +1,12 @@
 import numpy as np
 from semantic_odes.infinite_motifs import *
 from scipy.optimize import minimize
+from semantic_odes import utils
 
 MIN_TRANSITION_POINT_SEP = 1e-2
 MIN_PROPERTY_VALUE = 1e-3
+MIN_VERTICAL_SEPARATION = 1e-3
 MIN_RELATIVE_DISTANCE_TO_LAST_FINITE_TRANSITION_POINT = 0.2
-
-def softplus(x):
-    # Use piecewise to handle different ranges of x
-    mask = x > 20
-    res = np.zeros_like(x)
-    res[mask] = x[mask]
-    res[~mask] = np.log1p(np.exp(x[~mask]))
-    return res
-
-def sigmoid(x, threshold=20.0):
-    maskg20 = x > threshold
-    masklm20 = x < -threshold
-    res = np.zeros_like(x)
-    res[maskg20] = 1.0
-    res[masklm20] = 0.0
-    res[~maskg20 & ~masklm20] = 1 / (1 + np.exp(-x[~maskg20 & ~masklm20]))
-    return res
-
-
-def softmax(x, temperature=1.0):
-    """
-    Compute the softmax of vector x with a temperature parameter.
-    
-    Parameters:
-    x (numpy.ndarray): Input data.
-    temperature (float): Temperature parameter for scaling.
-    
-    Returns:
-    numpy.ndarray: Softmax probabilities.
-    """
-    if temperature <= 0:
-        raise ValueError("Temperature must be greater than zero.")
-    
-    x = np.array(x) / temperature
-    x_max = np.max(x, axis=-1, keepdims=True)
-    e_x = np.exp(x - x_max)
-    sum_e_x = np.sum(e_x, axis=-1, keepdims=True)
-    return e_x / sum_e_x
-
 
         
 class CubicModelNumpy:
@@ -66,7 +29,7 @@ class CubicModelNumpy:
         self.t = t
 
 
-        if self.composition[-1][-1] != 'c':
+        if utils.is_unbounded_composition(self.composition):
             # it is an infinite composition
             self.composition_finite_part = self.composition[:-1]
             self.infinite_motif = self.composition[-1]
@@ -77,53 +40,15 @@ class CubicModelNumpy:
             self.infinite_motif = None
             self.infinite_composition = False
 
-        # self.weights = torch.nn.Parameter(torch.randn(self.n_basis_functions, self.n_coordinates))
-        # self.horizontal_weights = torch.nn.Parameter(torch.randn(self.n_basis_functions, len(self.composition_finite_part)))
-        # self.vertical_weights = torch.nn.Parameter(torch.randn(self.n_basis_functions, len(self.composition_finite_part)))
-
-        # Special properties of the infinite motif
-        if self.infinite_composition:
-            num_properties = self.number_of_properties_for_infinite_motif()
-            # self.infinite_motif_properties_weights = torch.nn.Parameter(torch.randn(self.n_basis_functions, num_properties))
-            if len(self.composition) != 1:
-                # self.infinite_motif_start_weights = torch.nn.Parameter(torch.randn(self.n_basis_functions, 1))
-                pass
-
-        if self.composition[0][2] == 'c':
-            # if the first motif is finite we have an additional degree of freedom
-            # for the first derivative at the start
-            # self.first_derivative_at_start = torch.nn.Parameter(torch.randn(self.n_basis_functions, 1))
-            self.specified_first_derivative_at_start = True
-        else:
-            self.specified_first_derivative_at_start = False
-
-        if self.composition[-1][2] == 'c' and len(self.composition) != 1:
-            # if the last motif is finite (and it's not the only motif) we have an additional degree of freedom
-            # for the first derivative at the end
-            # with infinite composition, this is not needed as the last finite transition point is always an extremum or transition point
-            # self.first_derivative_at_end = torch.nn.Parameter(torch.randn(self.n_basis_functions, 1))
-            self.specified_first_derivative_at_end = True
-            self.specified_second_derivative_at_end = False
-        elif self.infinite_composition and len(self.composition) == 1:
-            # if the last motif is infinite and it's the only motif, we have an additional degree of freedom
-            # for the first derivative at the end
-            self.specified_first_derivative_at_end = True
-            second_derivative_vanishes = self.infinite_motif_classes[self.infinite_motif].second_derivative_vanishes()
-            if not second_derivative_vanishes:
-                self.specified_second_derivative_at_end = True
-            else:
-                self.specified_second_derivative_at_end = False
-        else:
-            self.specified_first_derivative_at_end = False
-            self.specified_second_derivative_at_end = False
+        self.first_derivative_at_start_status = utils.get_first_derivative_at_start_status(self.composition)
+        self.first_derivative_at_end_status = utils.get_first_derivative_at_end_status(self.composition)
+        self.second_derivative_at_end_status = utils.get_second_derivative_at_end_status(self.composition)
 
         self.arguments = {}
 
 
     def set_arguments(self, arguments):
         self.arguments = arguments
-
-
 
 
     def number_of_properties_for_infinite_motif(self):
@@ -133,7 +58,7 @@ class CubicModelNumpy:
         
             
     def extract_first_derivative_at_start(self):
-        if self.specified_first_derivative_at_start:
+        if self.first_derivative_at_start_status == 'weights':
 
             finite_coordinates = self.extract_coordinates_finite_composition()
 
@@ -143,65 +68,12 @@ class CubicModelNumpy:
             coordinate_1 = finite_coordinates[:,motif_index,:]
             coordinate_2 = finite_coordinates[:,motif_index+1,:]
 
-            calculated_first_derivative_ratio = sigmoid(first_derivative_at_start)
+            calculated_first_derivative_ratio = utils.sigmoid_np(first_derivative_at_start)
             slope_min, slope_max = self.get_first_derivative_range(0, coordinate_1, coordinate_2, "left")
             return slope_min + calculated_first_derivative_ratio * (slope_max - slope_min)
                 
         else:
             return None
-        
-    def extract_first_derivative_at_end(self):
-        raise NotImplementedError
-        if self.specified_first_derivative_at_end:
-
-            finite_coordinates = self.extract_coordinates_finite_composition()
-
-            first_derivative_at_end = self.arguments['first_derivative_at_end']
-
-            motif_index = len(self.composition_finite_part) - 1
-            coordinate_1 = finite_coordinates[:,motif_index,:]
-            coordinate_2 = finite_coordinates[:,motif_index+1,:]
-
-            calculated_first_derivative_ratio = sigmoid(first_derivative_at_end)
-            slope_min, slope_max = self.get_first_derivative_range(motif_index, coordinate_1, coordinate_2, "right")
-            return slope_min + calculated_first_derivative_ratio * (slope_max - slope_min)
-    
-    def extract_properties_infinite_motif(self):
-        raise NotImplementedError
-        infinite_properties = self.arguments['infinite_properties']
-
-        all_coefficients, finite_coordinates = self.get_coefficients_and_coordinates_finite_composition()
-        knots = finite_coordinates[:,0]
-        last_transition_point = finite_coordinates[-1,:]
-
-        if self.infinite_composition:
-            # add infinite knots
-            knots = np.concatenate([knots, np.array([np.inf])],axis=0)
-            properties = softplus(infinite_properties) + MIN_PROPERTY_VALUE
-        else:
-            properties = None
-
-        i = len(self.composition) - 1
-
-        if self.composition[i][2] != 'c' and i > 0:
-            last_first_derivative = 3*all_coefficients[i-1,0] * last_transition_point[0]**2 + 2 * all_coefficients[i-1,1] * last_transition_point[0] + all_coefficients[i-1,2]
-            last_second_derivative = 6*all_coefficients[i-1,0] * last_transition_point[0] + 2 * all_coefficients[i-1,1]
-        else:
-            last_first_derivative = None
-            last_second_derivative = None
-
-        x0 = last_transition_point[0]
-        y0 = last_transition_point[1]
-       
-        if len(self.composition) == 1:
-            # There is only an infinite motif
-        #    motif_class = self.infinite_motif_single_classes[self.infinite_motif]
-           return motif_class.extract_properties_from_network(properties.reshape((1,-1)), x0, y0, last_first_derivative, last_second_derivative).flatten()
-        else:
-            # There is a previous motif
-            motif_class = self.infinite_motif_classes[self.infinite_motif]
-            return motif_class.extract_properties_from_network(properties.reshape((1,-1)), x0, y0, last_first_derivative, last_second_derivative).flatten()
-      
     
     def extract_coordinates_finite_composition(self):
         x0 = self.x0
@@ -209,41 +81,56 @@ class CubicModelNumpy:
         vertical_values = self.arguments['vertical_values']
         t_last_finite_transition_point = self.arguments['t_last_finite_transition_point']
 
-       
-
         if self.infinite_composition:
             if len(self.composition) > 1:
                 # When fitting an individual sample, it makes sense to limit the position of the last finite transition point
                 # to the range of the time points
                 empirical_t_max = np.max(self.t)
                 empirical_range = empirical_t_max - self.t_range[0]
-                t_last_finite_transition_point = self.t_range[0] + MIN_TRANSITION_POINT_SEP + sigmoid(t_last_finite_transition_point) * (1-MIN_RELATIVE_DISTANCE_TO_LAST_FINITE_TRANSITION_POINT) * empirical_range
+                t_last_finite_transition_point = self.t_range[0] + MIN_TRANSITION_POINT_SEP + utils.sigmoid_np(t_last_finite_transition_point) * (1-MIN_RELATIVE_DISTANCE_TO_LAST_FINITE_TRANSITION_POINT) * empirical_range
             else:
                 t_last_finite_transition_point = self.t_range[0]
         else:
             t_last_finite_transition_point = self.t_range[1]
 
-
-
         all_coordinate_values = np.zeros((len(self.composition_finite_part)+1,2))
+
+        # if len(self.composition) > 1:
+        #     # pass horizontal values through a softmax function, and scale them by the range of the time points
+        #     scale = t_last_finite_transition_point - self.t_range[0]
+
+        #     trans_horizontal_values = utils.softmax_np(horizontal_values) * scale
+        #     good_indices = np.arange(len(trans_horizontal_values))
+        #     bad_indices = []
+
+        #     while np.min(trans_horizontal_values) < MIN_TRANSITION_POINT_SEP:
+        #         scale -= MIN_TRANSITION_POINT_SEP
+        #         i = np.argmin(trans_horizontal_values)
+        #         good_indices = good_indices[good_indices != i]
+        #         bad_indices.append(i)
+        #         new_horizontal_values = utils.softmax_np(horizontal_values[good_indices]) * scale
+        #         trans_horizontal_values = np.zeros_like(horizontal_values)
+        #         trans_horizontal_values[good_indices] = new_horizontal_values
+        #         trans_horizontal_values[bad_indices] = MIN_TRANSITION_POINT_SEP
+
+        #         horizontal_values = trans_horizontal_values
 
         # pass horizontal values through a softmax function, and scale them by the range of the time points
         scale = t_last_finite_transition_point - self.t_range[0]
 
         temp = 1.0
-        trans_horizontal_values = softmax(horizontal_values, temperature=temp) * scale
+        trans_horizontal_values = utils.softmax_np(horizontal_values, temperature=temp) * scale
 
         for _ in range(10):
             if np.min(trans_horizontal_values) >= MIN_TRANSITION_POINT_SEP:
                 break
             temp *= 2
-            trans_horizontal_values = softmax(horizontal_values, temperature=temp) * scale
+            trans_horizontal_values = utils.softmax_np(horizontal_values, temperature=temp) * scale
 
         horizontal_values = trans_horizontal_values
 
-
         # make sure vertical values are positive
-        vertical_values = softplus(vertical_values)
+        vertical_values = utils.softplus_np(vertical_values) # + MIN_VERTICAL_SEPARATION
         
         # j = 0
         all_coordinate_values[0,0] = self.t_range[0]
@@ -259,80 +146,59 @@ class CubicModelNumpy:
         return all_coordinate_values
 
     def type_of_transition_point(self, ind):
+        """
+        Determine the type of the transition point
+
+        Args:
+            ind: int, the index of the transition point
+        
+        Returns:
+            str, the type of the transition point
+        """
         composition = self.composition
-        if ind == 0:
-            return 'start'
-        elif ind == len(composition):
-            return 'end'
-        else:
-            if (composition[ind-1][:2] == "++") and (composition[ind][:2] == "+-"):
-                return 'inflection'
-            elif (composition[ind-1][:2] == "+-") and (composition[ind][:2] == "++"):
-                return 'inflection'
-            elif (composition[ind-1][:2] == "+-") and (composition[ind][:2] == "--"):
-                return 'max'
-            elif (composition[ind-1][:2] == "-+") and (composition[ind][:2] == "++"):
-                return 'min'
-            elif (composition[ind-1][:2] == "-+") and (composition[ind][:2] == "--"):
-                return 'inflection'
-            elif (composition[ind-1][:2] == "--") and (composition[ind][:2] == "-+"):
-                return 'inflection'
-            else:
-                raise ValueError('Unknown transition point type')
+        return utils.type_of_transition_point(composition, ind)
 
     def get_first_derivative_range(self, motif_index, point1, point2, which_point):
+        """
+        Get the range of the first derivative at a transition point
+
+        Args:
+            motif_index: int, the index of the motif
+            point1: numpy array of shape (2,) with the x and y coordinates of the first point
+            point2: numpy array of shape (2,) with the x and y coordinates of the second point
+            which_point: str, either "left" or "right" to specify which point to consider
+        
+        Returns:
+            tuple of two floats, the minimum and maximum values of the first derivative
+        """
         if np.isclose(point2[0], point1[0]):
-            print("exception")
+            print("The two transition points are too close")
             print(point1, point2)
             
         slope = (point2[1] - point1[1])/(point2[0] - point1[0])
-        motif = self.composition[motif_index]
 
-        if which_point == 'left':
-            if motif == '++c':
-                if self.type_of_transition_point(motif_index+1) == 'end':
-                    return 0, slope
-                elif self.type_of_transition_point(motif_index+1) == 'inflection':
-                    return 0, slope
-            elif motif == "+-c":
-                if self.type_of_transition_point(motif_index+1) == 'end':
-                    return slope, 2 * slope
-                elif self.type_of_transition_point(motif_index+1) == 'max':
-                    return 1.5 * slope, 3 * slope
-                elif self.type_of_transition_point(motif_index+1) == 'inflection':
-                    return slope, 3 * slope
-            elif motif == "-+c":
-                if self.type_of_transition_point(motif_index+1) == 'end':
-                    return slope, 2 * slope
-                elif self.type_of_transition_point(motif_index+1) == 'min':
-                    return 1.5 * slope, 3 * slope
-                elif self.type_of_transition_point(motif_index+1) == 'inflection':
-                    return slope, 3 * slope
-            elif motif == "--c":
-                if self.type_of_transition_point(motif_index+1) == 'end':
-                    return 0, slope
-                elif self.type_of_transition_point(motif_index+1) == 'inflection':
-                    return 0, slope
+        coefficients = utils.get_first_derivative_range_coefficients(self.composition, motif_index, which_point)
+        return coefficients[0] * slope, coefficients[1] * slope
+    
+    def _create_row(self, point, order):
+        """
+        Create a row of the matrix A for the system of equations to find the coefficients of the cubic polynomial
+
+        Args:
+            point: numpy array of shape (2,) with the x and y coordinates of the point
+            order: int, the order of the derivative to be used in the row
         
-        elif which_point == 'right':
-            if motif == '++c':
-                if self.type_of_transition_point(motif_index) == 'inflection':
-                    return slope, 3*slope
-                elif self.type_of_transition_point(motif_index) == 'min':
-                    return 1.5 * slope, 3 * slope
-            elif motif == "+-c":
-                if self.type_of_transition_point(motif_index) == 'inflection':
-                    return 0, slope
-            elif motif == "-+c":
-                if self.type_of_transition_point(motif_index) == 'inflection':
-                    return 0, slope
-            elif motif == "--c":
-                if self.type_of_transition_point(motif_index) == 'inflection':
-                    return slope, 3 * slope
-                elif self.type_of_transition_point(motif_index) == 'max':
-                    return 1.5 * slope, 3 * slope
-                
-        # in general left of -a and right of +a are the same and vice versa.
+        Returns:
+            numpy array of shape (4,) with the coefficients of the row
+        """
+        if order == 0:
+            return np.array([point[0]**3, point[0]**2, point[0], 1])
+        elif order == 1:
+            return np.array([3*point[0]**2, 2*point[0], 1, 0])
+        elif order == 2:
+            return np.array([6*point[0], 2, 0, 0])
+        else:
+            raise ValueError("Invalid order")
                 
     def get_coefficients_and_coordinates_finite_composition(self):
 
@@ -348,22 +214,22 @@ class CubicModelNumpy:
             coordinate_1 = finite_coordinates[motif_index,:]
             coordinate_2 = finite_coordinates[motif_index+1,:]
 
-            A_row_0 = np.array([coordinate_1[0]**3, coordinate_1[0]**2, coordinate_1[0], 1])
-            A_row_1 = np.array([coordinate_2[0]**3, coordinate_2[0]**2, coordinate_2[0], 1])
+            A_row_0 = self._create_row(coordinate_1, 0)
+            A_row_1 = self._create_row(coordinate_2, 0)
             b_0 = coordinate_1[1]
             b_1 = coordinate_2[1]
 
             type_1 = self.type_of_transition_point(motif_index)
             type_2 = self.type_of_transition_point(motif_index+1)
             if type_1 == 'max' or type_1 == 'min':
-                A_row_2 = np.array([3*coordinate_1[0]**2, 2*coordinate_1[0], 1, 0])
+                A_row_2 = self._create_row(coordinate_1, 1)
                 b_2 = 0
             elif type_1 == 'inflection':
-                A_row_2 = np.array([6*coordinate_1[0], 2, 0, 0])
+                A_row_2 = self._create_row(coordinate_1, 2)
                 b_2 = 0
-            elif type_1 == 'start' and self.specified_first_derivative_at_start:
-                A_row_2 = np.array([3*coordinate_1[0]**2, 2*coordinate_1[0], 1, 0])
-                calculated_first_derivative_ratio = sigmoid(first_derivative_at_start)
+            elif type_1 == 'start' and self.first_derivative_at_start_status == 'weights':
+                A_row_2 = self._create_row(coordinate_1, 1)
+                calculated_first_derivative_ratio = utils.sigmoid_np(first_derivative_at_start)
                 slope_min, slope_max = self.get_first_derivative_range(motif_index, coordinate_1, coordinate_2, "left")
                 b_2 = slope_min + calculated_first_derivative_ratio * (slope_max - slope_min)
                 if type_2 == 'end':
@@ -371,21 +237,22 @@ class CubicModelNumpy:
                     A_row_3 = np.array([1, 0, 0, 0])
                     b_3 = 0
             if type_2 == 'max' or type_2 == 'min':
-                A_row_3 = np.array([3*coordinate_2[0]**2, 2*coordinate_2[0], 1, 0])
+                A_row_3 = self._create_row(coordinate_2, 1)
                 b_3 = 0
             elif type_2 == 'inflection':
-                A_row_3 = np.array([6*coordinate_2[0], 2, 0, 0])
+                # A_row_3 = np.array([6*coordinate_2[0], 2, 0, 0])
+                A_row_3 = self._create_row(coordinate_2, 2)
                 b_3 = 0
-            elif (type_2 == 'end' and self.specified_first_derivative_at_end) and type_1 != 'start':
-                A_row_3 = np.array([3*coordinate_2[0]**2, 2*coordinate_2[0], 1, 0])
-                calculated_first_derivative_ratio = sigmoid(first_derivative_at_end)
+            elif (type_2 == 'end' and self.first_derivative_at_end_status == 'weights') and type_1 != 'start':
+                A_row_3 = self._create_row(coordinate_2, 1)
+                calculated_first_derivative_ratio = utils.sigmoid_np(first_derivative_at_end)
                 slope_min, slope_max = self.get_first_derivative_range(motif_index, coordinate_1, coordinate_2, "right")
                 b_3 = slope_min + calculated_first_derivative_ratio * (slope_max - slope_min)
 
             A = np.stack([A_row_0, A_row_1, A_row_2, A_row_3], axis=0)
             b = np.stack([b_0, b_1, b_2, b_3], axis=0)
 
-            if np.abs(np.linalg.det(A)) < 1e-9:
+            if np.abs(np.linalg.det(A)) < 1e-9 or np.abs(np.linalg.det(A)) > 1e9:
                 # print("exception")
                 # just connect with a line
                 slope = (coordinate_2[1] - coordinate_1[1])/(coordinate_2[0]-coordinate_1[0])
@@ -438,7 +305,7 @@ class CubicModelNumpy:
         if self.infinite_composition:
             # add infinite knots
             knots = np.concatenate([knots, np.array([np.inf])],axis=0)
-            properties = softplus(infinite_properties) + MIN_PROPERTY_VALUE
+            properties = utils.softplus_np(infinite_properties) + MIN_PROPERTY_VALUE
         else:
             properties = None
 
@@ -448,18 +315,33 @@ class CubicModelNumpy:
         Y_pred = np.zeros(len(T))
 
         for i in range(len(self.composition)):
-            if self.composition[i][2] != 'c' and i > 0:
-                last_first_derivative = 3*all_coefficients[i-1,0] * last_transition_point[0]**2 + 2 * all_coefficients[i-1,1] * last_transition_point[0] + all_coefficients[i-1,2]
-                last_second_derivative = 6*all_coefficients[i-1,0] * last_transition_point[0] + 2 * all_coefficients[i-1,1]
-            elif self.composition[i][2] != 'c' and i == 0:
-                assert self.specified_first_derivative_at_end
-                sign = 1 if self.composition[-1][0] == '+' else -1
-                last_first_derivative = sign * softplus(self.arguments['first_derivative_at_end'])
-                if self.specified_second_derivative_at_end:
-                    sign = 1 if self.composition[-1][1] == '+' else -1
-                    last_second_derivative = sign * softplus(self.arguments['second_derivative_at_end'])
+
+            if utils.is_unbounded_motif(self.composition[i]):
+                # We need to specify the derivatives at end
+
+                last_first_derivative_status = utils.get_first_derivative_at_end_status(self.composition)
+                last_second_derivative_status = utils.get_second_derivative_at_end_status(self.composition)
+
+                if last_first_derivative_status == "zero":
+                    last_first_derivative = 0
+                elif last_first_derivative_status == "cubic":
+                    last_first_derivative = utils.evaluate_cubic(all_coefficients[i-1], last_transition_point[0], derivative_order=1)
+                elif last_first_derivative_status == "weights":
+                    sign = 1 if self.composition[-1][0] == '+' else -1
+                    last_first_derivative = sign * utils.softplus_np(self.arguments['first_derivative_at_end'])
                 else:
-                    last_second_derivative = np.zeros_like(last_first_derivative)
+                    raise ValueError("Unknown first derivative status")
+                
+                if last_second_derivative_status == "zero":
+                    last_second_derivative = 0
+                elif last_second_derivative_status == "cubic":
+                    last_second_derivative = utils.evaluate_cubic(all_coefficients[i-1], last_transition_point[0], derivative_order=2)
+                elif last_second_derivative_status == "weights":
+                    sign = 1 if self.composition[-1][1] == '+' else -1
+                    last_second_derivative = sign * utils.softplus_np(self.arguments['second_derivative_at_end'])
+                else:
+                    raise ValueError("Unknown second derivative status")
+
             else:
                 last_first_derivative = None
                 last_second_derivative = None
@@ -516,17 +398,17 @@ def create_dictionary_for_a_model(model):
         if len(model.composition) != 1:
             n_parameters['t_last_finite_transition_point'] = 1
 
-    if model.specified_first_derivative_at_start:
+    if model.first_derivative_at_start_status == 'weights':
         n_parameters['first_derivative_at_start'] = 1
     else:
         n_parameters['first_derivative_at_start'] = 0
     
-    if model.specified_first_derivative_at_end:
+    if model.first_derivative_at_end_status == 'weights':
         n_parameters['first_derivative_at_end'] = 1
     else:
         n_parameters['first_derivative_at_end'] = 0
     
-    if model.specified_second_derivative_at_end:
+    if model.second_derivative_at_end_status == 'weights':
         n_parameters['second_derivative_at_end'] = 1
     else:
         n_parameters['second_derivative_at_end'] = 0
@@ -544,96 +426,6 @@ def create_dictionary_for_a_model(model):
 
     return dictionary, n_all_parameters
 
-
-
-def calculate_loss_3_samples(composition, t_range, before, middle, after, seed=0, train_on_all_data=False):
-
-    before_x0, before_t, before_y = before
-    middle_x0, middle_t, middle_y = middle
-    after_x0, after_t, after_y = after
-
-    gen = np.random.default_rng(seed=seed)
-
-    if train_on_all_data:
-        before_t_train = before_t
-        before_y_train = before_y
-        middle_t_train = middle_t
-        middle_y_train = middle_y
-        after_t_train = after_t
-        after_y_train = after_y
-    else:
-        before_train_indices = np.arange(int(0.8*len(before_t)))
-        middle_train_indices = np.arange(int(0.8*len(middle_t)))
-        after_train_indices = np.arange(int(0.8*len(after_t)))
-
-        before_t_train = before_t[before_train_indices]
-        before_y_train = before_y[before_train_indices]
-        middle_t_train = middle_t[middle_train_indices]
-        middle_y_train = middle_y[middle_train_indices]
-        after_t_train = after_t[after_train_indices]
-        after_y_train = after_y[after_train_indices]
-
-        before_t_test = before_t[before_train_indices]
-        before_y_test = before_y[before_train_indices]
-        middle_t_test = middle_t[middle_train_indices]
-        middle_y_test = middle_y[middle_train_indices]
-        after_t_test = after_t[after_train_indices]
-        after_y_test = after_y[after_train_indices]
-    
-
-    model_before = CubicModelNumpy(composition, t_range, before_x0, before_t, before_y)
-    model_middle = CubicModelNumpy(composition, t_range, middle_x0, middle_t, middle_y)
-    model_after = CubicModelNumpy(composition, t_range, after_x0, after_t, after_y)
-
-    dictionary, n_all_parameters = create_dictionary_for_a_model(model_middle)
-
-    initial_guess = gen.normal(size=n_all_parameters * 2)
-
-    def loss_function(weights_and_biases):
-
-        weights = weights_and_biases[:n_all_parameters]
-        biases = weights_and_biases[n_all_parameters:]
-
-        before_parameters = before_x0 * weights + biases
-        middle_parameters = middle_x0 * weights + biases
-        after_parameters = after_x0 * weights + biases
-
-        before_arguments = from_parameters_to_arguments(before_parameters, dictionary)
-        middle_arguments = from_parameters_to_arguments(middle_parameters, dictionary)
-        after_arguments = from_parameters_to_arguments(after_parameters, dictionary)
-
-        model_before.set_arguments(before_arguments)
-        model_middle.set_arguments(middle_arguments)
-        model_after.set_arguments(after_arguments)
-
-        before_y_pred = model_before.forward(before_t_train)
-        middle_y_pred = model_middle.forward(middle_t_train)
-        after_y_pred = model_after.forward(after_t_train)
-
-        before_loss = np.mean((before_y_pred - before_y_train)**2)
-        middle_loss = np.mean((middle_y_pred - middle_y_train)**2)
-        after_loss = np.mean((after_y_pred - after_y_train)**2)
-
-
-        return before_loss + 2*middle_loss + after_loss
-    
-    result = minimize(loss_function, initial_guess, method='L-BFGS-B')
-
-    weights = result.x[:n_all_parameters]
-    biases = result.x[n_all_parameters:]
-
-    middle_parameters = middle_x0 * weights + biases
-    middle_arguments = from_parameters_to_arguments(middle_parameters, dictionary)
-    model_middle.set_arguments(middle_arguments)
-
-    if train_on_all_data:
-        middle_y_pred_test = model_middle.forward(middle_t)
-        final_loss = np.mean((middle_y_pred_test - middle_y)**2)
-    else:
-        middle_y_pred_test = model_middle.forward(middle_t_test)
-        final_loss = np.mean((middle_y_pred_test - middle_y_test)**2)
-    
-    return final_loss, model_middle
 
 
 def calculate_loss(composition, t_range, x0, t, y,seed=0, train_on_all_data=False, evaluate_on_all_data=True):
@@ -658,6 +450,7 @@ def calculate_loss(composition, t_range, x0, t, y,seed=0, train_on_all_data=Fals
     dictionary, n_all_parameters = create_dictionary_for_a_model(model)
     
     initial_guess = gen.normal(size=n_all_parameters)
+    # initial_guess = np.zeros(n_all_parameters)
 
     def loss_function(parameters):
 

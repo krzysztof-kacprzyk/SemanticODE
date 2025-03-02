@@ -3,6 +3,7 @@ import numpy as np
 from scipy.integrate import odeint
 import pandas as pd
 from scipy.interpolate import UnivariateSpline
+
 class ODEBase(ABC):
 
     def __init__(self, name):
